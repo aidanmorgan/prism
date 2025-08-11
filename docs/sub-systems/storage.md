@@ -200,21 +200,180 @@ The hot storage layer implements a dual-structure approach with WAL for fast wri
 
 Each tenant maintains independent WAL sequences that ensure ordered processing and crash recovery:
 
+#### Atomic WAL Write Operations
+
+**NFS/EFS Symlink-Based Locking Strategy**:
+
+Since EFS is NFS under the hood and doesn't guarantee POSIX flock() behavior, the system uses atomic symlink creation for WAL write coordination (same approach as columnar storage):
+
+```
+Atomic WAL Write Protocol:
+├── 1. Generate unique write lock: .wal-write-{lambda-id}-{timestamp}
+├── 2. Attempt atomic symlink creation: ln -s {unique-id} .wal-write-lock
+├── 3. If successful: proceed with write operation
+├── 4. Write complete record with O_APPEND  
+├── 5. fsync() to ensure durability
+└── 6. Delete symlink: rm .wal-write-lock
+```
+
+**WAL Record Structure with Integrity**:
+```
+Individual WAL Record Format:
+├── Record Header: [Length: 4 bytes, CRC32: 4 bytes]
+├── LSN: [File_Seq: 4 bytes, Record_Seq: 4 bytes]
+├── Timestamp: [Unix_Timestamp: 8 bytes]
+├── Schema_Hash: [Hash: 8 bytes]
+├── Event_Data: [Variable length, JSON or binary]
+└── Record Footer: [Magic: 4 bytes = 0xDEADBEEF]
+
+Total record size: Header(8) + LSN(8) + Timestamp(8) + Schema(8) + Data(N) + Footer(4)
+```
+
 **WAL File Structure**:
 ```
 wal-00001.log Format:
-├── Header: [Magic: PRISM_WAL, Version: 1.0, Tenant: abc123]
-├── Record 1: [LSN: 00001.001, Timestamp, Schema_Hash, Event_Data]
-├── Record 2: [LSN: 00001.002, Timestamp, Schema_Hash, Event_Data]
-├── Record N: [LSN: 00001.N, ...] (up to 64MB file size limit)
-└── Footer: [CRC32: file_checksum, Record_Count: N]
+├── File Header: [Magic: PRISM_WAL, Version: 1.0, Tenant: abc123]
+├── Record 1: [Complete atomic record with integrity checks]
+├── Record 2: [Complete atomic record with integrity checks]
+├── Record N: [Complete atomic record with integrity checks]
+└── File Footer: [Record_Count: N, File_CRC32: checksum] (written on rotation)
 ```
 
-**Sequence Numbering**:
+#### Atomic Write Implementation
+
+**NFS Symlink Locking for Concurrent Safety**:
+```mermaid
+sequenceDiagram
+    participant Lambda1 as Lambda Instance 1
+    participant Lambda2 as Lambda Instance 2
+    participant WAL as WAL File (EFS)
+    participant EFS as EFS Directory
+
+    Note over Lambda1, Lambda2: CONCURRENT WAL WRITES
+    
+    Lambda1->>Lambda1: Generate unique lock ID: lambda-abc-1640995200
+    Lambda2->>Lambda2: Generate unique lock ID: lambda-def-1640995201
+    
+    Lambda1->>EFS: ln -s "lambda-abc-1640995200" .wal-write-lock
+    Lambda2->>EFS: ln -s "lambda-def-1640995201" .wal-write-lock
+    
+    EFS-->>Lambda1: Success (atomic symlink created)
+    EFS-->>Lambda2: EEXIST (symlink already exists)
+    
+    Note over Lambda2: Lambda2 waits and retries
+    
+    Lambda1->>WAL: open(wal_file, O_WRONLY|O_APPEND)
+    Lambda1->>WAL: write(complete_record) # Atomic append
+    Lambda1->>WAL: fsync(wal_fd) # Force to disk
+    Lambda1->>EFS: rm .wal-write-lock # Release lock
+    
+    Note over Lambda2: Lambda2 retries lock acquisition
+    Lambda2->>EFS: ln -s "lambda-def-1640995201" .wal-write-lock
+    EFS-->>Lambda2: Success (atomic symlink created)
+    
+    Lambda2->>WAL: open(wal_file, O_WRONLY|O_APPEND)
+    Lambda2->>WAL: write(complete_record) # Atomic append
+    Lambda2->>WAL: fsync(wal_fd) # Force to disk
+    Lambda2->>EFS: rm .wal-write-lock # Release lock
+    
+    Note over Lambda1, Lambda2: Both records written safely, no corruption
+```
+
+**WAL Directory Structure with Lock Files**:
+```
+/efs/wal/tenant-abc123/stream-0/
+├── wal-00001.log              # Completed WAL file
+├── wal-00002.log              # Current active WAL file
+├── .current → wal-00002.log   # Active file pointer
+├── .wal-write-lock → lambda-xyz-1640995200  # Write lock (if held)
+├── .checkpoint                # Last processed LSN
+└── .processing/               # Processing directory
+    ├── wal-00001.log.link     # Hard link for processing
+    └── .lock-00001            # Processing lock file
+```
+
+**Symlink-Based Write Process**:
+```
+Write Process:
+├── 1. Calculate record length and CRC32
+├── 2. Prepare complete record in memory
+├── 3. Generate unique lock identifier: lambda-{id}-{timestamp}
+├── 4. Attempt atomic symlink: ln -s {unique-id} .wal-write-lock
+├── 5. If EEXIST: wait and retry with exponential backoff
+├── 6. If success: open WAL file with O_WRONLY|O_APPEND
+├── 7. Write complete record atomically
+├── 8. fsync() for durability guarantee
+└── 9. Delete symlink: rm .wal-write-lock
+
+Read/Validation Process:
+├── 1. Read record header (length + CRC32)
+├── 2. Read exact record length
+├── 3. Validate CRC32 matches content
+├── 4. Verify magic footer is present
+└── 5. Parse record if validation passes
+```
+
+**Sequence Numbering with Symlink Locking**:
 - **File Sequence**: Monotonic file numbers per tenant (00001, 00002, 00003...)
-- **Log Sequence Numbers (LSN)**: Format `{file_seq}.{record_seq}` ensures global ordering
+- **Record Sequence**: Atomic increment within symlink lock critical section
+- **LSN Generation**: Format `{file_seq}.{record_seq}` ensures global ordering
 - **Independent Sequences**: Each tenant maintains separate sequence space
 - **Recovery Order**: Process files in sequence order, records in LSN order
+- **Concurrent Safety**: Symlink atomicity ensures only one writer increments sequence at a time
+
+#### WAL Write Performance and Error Handling
+
+**Symlink Lock Contention Mitigation**:
+- **Short Critical Sections**: Symlink held only during write, not record preparation
+- **Pre-calculated Records**: Prepare complete record in memory before lock acquisition
+- **Fast fsync()**: EFS optimized for small, frequent syncs
+- **Unique Lock IDs**: Lambda execution ID + timestamp prevents conflicts
+- **Retry Logic**: Exponential backoff for symlink creation failures (EEXIST)
+- **Stale Lock Cleanup**: Symlinks with old timestamps can be forcibly removed
+
+**Symlink Lock Error Handling Strategies**:
+```
+Write Failure Scenarios:
+├── Symlink EEXIST: Retry with exponential backoff (max 3 attempts)
+├── Stale Lock Detection: Remove symlinks older than 30 seconds
+├── Disk Full: Trigger WAL rotation, retry on new file
+├── I/O Error: Mark WAL file corrupted, rotate to new file
+├── Network Partition: Buffer in memory, retry when connection restored
+└── Lambda Timeout: Graceful degradation, return error to client
+
+Stale Lock Cleanup:
+├── 1. Check symlink timestamp in lock identifier
+├── 2. If older than 30 seconds: rm .wal-write-lock
+├── 3. Retry symlink creation after cleanup
+└── 4. Log warning about stale lock removal
+```
+
+**Performance Characteristics**:
+- **Lock Hold Time**: ~1-5ms per record (minimal contention)
+- **Write Throughput**: ~1000-5000 records/second per tenant WAL file
+- **Concurrency**: Up to 10 concurrent Lambda writers per tenant (EFS limit)
+- **Latency Impact**: ~2-10ms additional latency for lock acquisition
+- **Backpressure**: Client receives error if lock timeout exceeded
+
+**Corruption Detection and Recovery**:
+```mermaid
+flowchart TB
+    A[Read WAL Record] --> B[Validate Record Header]
+    B --> C{Length Valid?}
+    C -->|No| D[Mark Record Corrupted]
+    C -->|Yes| E[Read Record Body]
+    E --> F[Calculate CRC32]
+    F --> G{CRC32 Matches?}
+    G -->|No| D
+    G -->|Yes| H[Validate Footer Magic]
+    H --> I{Footer Valid?}
+    I -->|No| D
+    I -->|Yes| J[Record Valid - Process]
+    
+    D --> K[Skip to Next Record]
+    K --> L[Log Corruption Warning]
+    L --> M[Continue Processing]
+```
 
 **Checkpoint Management**:
 ```json
@@ -224,7 +383,9 @@ wal-00001.log Format:
   "last_processed_lsn": "00003.147",
   "last_manifest_update": "2024-01-15T10:30:00Z",
   "processing_state": "complete",
-  "column_blocks_written": ["block_001", "block_002"]
+  "column_blocks_written": ["block_001", "block_002"],
+  "corruption_count": 0,
+  "last_corruption_lsn": null
 }
 ```
 
